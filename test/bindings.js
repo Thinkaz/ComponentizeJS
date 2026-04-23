@@ -81,6 +81,7 @@ suite('Bindings', async () => {
           disableFeatures: maybeLogging(disableFeatures),
           debugBuild: DEBUG_TEST_ENABLED,
           enableAot: WEVAL_TEST_ENABLED,
+          noSnapshot: testcase.noSnapshot || false,
         });
 
         const map = {

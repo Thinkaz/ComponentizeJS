@@ -1,0 +1,5 @@
+package local:no-snapshot-smoke;
+
+world the-world {
+  export hello: func() -> string;
+}

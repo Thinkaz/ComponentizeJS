@@ -240,9 +240,58 @@ export async function componentize(
   env['IMPORT_CNT'] = imports.length;
 
   if (debugBindings) {
-    console.error('--- Wizer Env ---');
+    console.error('--- Env ---');
     console.error(env);
   }
+
+  // -----------------------------------------------------------------------
+  // No-snapshot path: skip Wizer, embed JS source in the Wasm binary
+  //
+  //  noSnapshot === true       → embed env + initializer + source
+  //  noSnapshot === 'external' → embed env + initializer only; source is
+  //                               loaded at runtime from WASI filesystem
+  // -----------------------------------------------------------------------
+  if (opts.noSnapshot) {
+    const isExternal = opts.noSnapshot === 'external';
+    const envBytes = serializeEnv(env);
+    const initBytes = new TextEncoder().encode(jsBindings);
+    const sourceBytes = isExternal
+      ? new Uint8Array(0)
+      : new TextEncoder().encode(jsSource);
+
+    const embeddedWasm = embedSourceInWasm(
+      new Uint8Array(wasm),
+      envBytes,
+      initBytes,
+      sourceBytes,
+    );
+
+    await rm(workDir, { recursive: true });
+
+    const component = await metadataAdd(
+      await componentNew(
+        embeddedWasm,
+        Object.entries({
+          wasi_snapshot_preview1: await readFile(preview2Adapter),
+        }),
+        false,
+      ),
+      Object.entries({
+        language: [['JavaScript', '']],
+        'processed-by': [['ComponentizeJS', version]],
+      }),
+    );
+
+    imports = imports.map(([specifier, impt]) =>
+      specifier === '$root' ? [impt, 'default'] : [specifier, impt],
+    );
+
+    return { component, imports };
+  }
+
+  // -----------------------------------------------------------------------
+  // Normal (Wizer) path
+  // -----------------------------------------------------------------------
 
   sourcePath = maybeWindowsPath(sourcePath);
   let workspacePrefix = dirname(sourcePath);
@@ -639,4 +688,201 @@ async function detectKnownSourceExportNames(filename, code) {
   }
 
   return names;
+}
+
+// ---------------------------------------------------------------------------
+// No-snapshot mode utilities
+// ---------------------------------------------------------------------------
+
+/** Serialize an env object into null-terminated KEY=VALUE pairs. */
+function serializeEnv(env) {
+  const parts = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined && value !== null) {
+      parts.push(`${key}=${String(value)}\0`);
+    }
+  }
+  return new TextEncoder().encode(parts.join(''));
+}
+
+// ---------------------------------------------------------------------------
+// Wasm binary manipulation
+// ---------------------------------------------------------------------------
+
+/** Read an unsigned LEB128 value.  Returns [value, newOffset]. */
+function readULEB128(buf, pos) {
+  let result = 0;
+  let shift = 0;
+  while (true) {
+    const byte = buf[pos++];
+    result |= (byte & 0x7f) << shift;
+    if (!(byte & 0x80)) break;
+    shift += 7;
+  }
+  return [result, pos];
+}
+
+/** Encode an unsigned LEB128 value. */
+function writeULEB128(value) {
+  const out = [];
+  do {
+    let byte = value & 0x7f;
+    value >>>= 7;
+    if (value) byte |= 0x80;
+    out.push(byte);
+  } while (value);
+  return out;
+}
+
+/** Encode a signed LEB128 value (for i32.const operands). */
+function writeSLEB128(value) {
+  const out = [];
+  while (true) {
+    let byte = value & 0x7f;
+    value >>= 7;
+    const done =
+      (value === 0 && (byte & 0x40) === 0) ||
+      (value === -1 && (byte & 0x40) !== 0);
+    if (!done) byte |= 0x80;
+    out.push(byte);
+    if (done) break;
+  }
+  return out;
+}
+
+/**
+ * Embed source data into a Wasm module by adding a data segment.
+ *
+ * Layout at the data offset (page-aligned):
+ *   [4 bytes] magic  0x4352534A ("JSRC" LE)
+ *   [4 bytes] total_size
+ *   [4 bytes] env_len
+ *   [4 bytes] init_len
+ *   [4 bytes] source_len
+ *   [env_len bytes]    environment data
+ *   [init_len bytes]   initializer JS
+ *   [source_len bytes] user source JS
+ */
+function embedSourceInWasm(wasmBuf, envBytes, initBytes, sourceBytes) {
+  const MAGIC = 0x4352534a;
+  const HEADER_SIZE = 20; // 5 × u32
+
+  // -- Parse sections -------------------------------------------------------
+  if (
+    wasmBuf[0] !== 0x00 ||
+    wasmBuf[1] !== 0x61 ||
+    wasmBuf[2] !== 0x73 ||
+    wasmBuf[3] !== 0x6d
+  ) {
+    throw new Error('embedSourceInWasm: not a valid Wasm binary');
+  }
+
+  const sections = [];
+  let pos = 8; // skip magic + version
+  while (pos < wasmBuf.length) {
+    const id = wasmBuf[pos++];
+    const [size, payloadStart] = readULEB128(wasmBuf, pos);
+    sections.push({
+      id,
+      payload: wasmBuf.slice(payloadStart, payloadStart + size),
+    });
+    pos = payloadStart + size;
+  }
+
+  // -- Modify Memory section (id 5) -----------------------------------------
+  const memIdx = sections.findIndex((s) => s.id === 5);
+  if (memIdx === -1) throw new Error('embedSourceInWasm: no Memory section');
+
+  let mpos = 0;
+  const [memCount, mpos2] = readULEB128(sections[memIdx].payload, mpos);
+  mpos = mpos2;
+  const hasMax = sections[memIdx].payload[mpos++];
+  const [minPages, mpos3] = readULEB128(sections[memIdx].payload, mpos);
+
+  const dataOffset = minPages * 65536;
+  const bodyLen = envBytes.length + initBytes.length + sourceBytes.length;
+  const totalBlobSize = HEADER_SIZE + bodyLen;
+  const newMinPages = minPages + Math.ceil(totalBlobSize / 65536);
+
+  if (hasMax === 0x00) {
+    sections[memIdx].payload = new Uint8Array([
+      ...writeULEB128(memCount),
+      0x00,
+      ...writeULEB128(newMinPages),
+    ]);
+  } else {
+    const [maxPages] = readULEB128(sections[memIdx].payload, mpos3);
+    const newMax = Math.max(maxPages, newMinPages);
+    sections[memIdx].payload = new Uint8Array([
+      ...writeULEB128(memCount),
+      0x01,
+      ...writeULEB128(newMinPages),
+      ...writeULEB128(newMax),
+    ]);
+  }
+
+  // -- Build the embedded data blob -----------------------------------------
+  const blob = new Uint8Array(totalBlobSize);
+  const dv = new DataView(blob.buffer);
+  dv.setUint32(0, MAGIC, true);
+  dv.setUint32(4, totalBlobSize, true);
+  dv.setUint32(8, envBytes.length, true);
+  dv.setUint32(12, initBytes.length, true);
+  dv.setUint32(16, sourceBytes.length, true);
+  blob.set(envBytes, HEADER_SIZE);
+  blob.set(initBytes, HEADER_SIZE + envBytes.length);
+  blob.set(sourceBytes, HEADER_SIZE + envBytes.length + initBytes.length);
+
+  // -- Build an active data segment for the blob ----------------------------
+  // segment := 0x00  i32.const <offset>  end  <vec<byte>>
+  const segment = new Uint8Array([
+    0x00, // active, memory 0
+    0x41, // i32.const
+    ...writeSLEB128(dataOffset),
+    0x0b, // end
+    ...writeULEB128(blob.length),
+    ...blob,
+  ]);
+
+  // -- Append to Data section (id 11) ---------------------------------------
+  const dataSecIdx = sections.findIndex((s) => s.id === 11);
+  if (dataSecIdx === -1) {
+    // No existing Data section – create one with 1 segment
+    sections.push({
+      id: 11,
+      payload: new Uint8Array([...writeULEB128(1), ...segment]),
+    });
+  } else {
+    const old = sections[dataSecIdx].payload;
+    const [segCount, countEnd] = readULEB128(old, 0);
+    const rest = old.slice(countEnd);
+    sections[dataSecIdx].payload = new Uint8Array([
+      ...writeULEB128(segCount + 1),
+      ...rest,
+      ...segment,
+    ]);
+  }
+
+  // -- Update DataCount section (id 12) if present --------------------------
+  const dcIdx = sections.findIndex((s) => s.id === 12);
+  if (dcIdx !== -1) {
+    const [dcCount] = readULEB128(sections[dcIdx].payload, 0);
+    sections[dcIdx].payload = new Uint8Array(writeULEB128(dcCount + 1));
+  }
+
+  // -- Reassemble -----------------------------------------------------------
+  const parts = [wasmBuf.slice(0, 8)]; // magic + version
+  for (const sec of sections) {
+    parts.push(new Uint8Array([sec.id]));
+    parts.push(new Uint8Array(writeULEB128(sec.payload.length)));
+    parts.push(sec.payload);
+  }
+  const totalLen = parts.reduce((s, p) => s + p.length, 0);
+  const result = new Uint8Array(totalLen);
+  let off = 0;
+  for (const p of parts) {
+    result.set(p, off);
+    off += p.length;
+  }
+  return result;
 }

@@ -1,7 +1,10 @@
 #include "extension-api.h"
 #include <js/BigInt.h>
+#include <js/SourceText.h>
 #include <jsapi.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 // #include <assert.h>
 #include <unistd.h>
 #include <js/Array.h>

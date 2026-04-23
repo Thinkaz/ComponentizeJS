@@ -1,0 +1,19 @@
+package glyph:source@0.1.0;
+
+interface types {
+  record novel {
+    title: string,
+    url: string,
+    cover: option<string>,
+    author: option<string>,
+  }
+}
+
+interface source {
+  use types.{novel};
+  search-novels: func(query: string, page: u32) -> list<novel>;
+}
+
+world extension {
+  export source;
+}
